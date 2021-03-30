@@ -48,6 +48,8 @@ struct pa_struct {
   pa_buffer_attr buffer_attr;
   int requested_bytes;
   int locked;
+  pa_usec_t latency;
+  int latency_needs_update;
 } data;
 
 static void context_state_cb(__attribute__((unused)) pa_context *context, void *userdata) {
@@ -64,6 +66,22 @@ static void stream_state_cb(__attribute__((unused)) pa_stream *s, void *userdata
 
 static void stream_latency_cb(__attribute__((unused)) pa_stream *s, void *userdata) {
   struct pa_struct* pulseaudio = (struct pa_struct*)userdata;
+  int ret;
+  pa_usec_t latency;
+  int negative;
+
+  if (!pulseaudio->stream)
+    return;
+
+  ret = pa_stream_get_latency(pulseaudio->stream, &latency, &negative);
+  if (ret)
+    return;
+
+  if (abs(pulseaudio->latency - latency) < config.latency_threshold)
+    return;
+
+  pulseaudio->latency = latency;
+  pulseaudio->latency_needs_update = 1;
 
   pa_threaded_mainloop_signal(pulseaudio->mainloop, 0);
 }
@@ -150,6 +168,11 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
     /* Get the PulseAudio sink name. */
     if (config_lookup_string(config.cfg, "pa.sink", &str)) {
       config.pa_sink = (char *)str;
+    }
+
+    /* Get the PulseAudio latency threshold */
+    if (!config_lookup_int(config.cfg, "pa.latency_threshold", &config.latency_threshold)) {
+      config.latency_threshold = 5000;
     }
   }
 
@@ -275,13 +298,13 @@ static void start(int sample_rate, int sample_format) {
   pa_stream_set_write_callback(data.stream, stream_write_cb, (void*)&data);
   pa_stream_set_latency_update_callback(data.stream, stream_latency_cb, (void*)&data);
 
-  pa_usec_t latency = 300000;
+  data.latency = 10000;
 
-  data.buffer_attr.fragsize = pa_usec_to_bytes(latency, &data.sample_spec);
-  data.buffer_attr.maxlength = pa_usec_to_bytes(latency, &data.sample_spec);
+  data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
+  data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
   data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
   data.buffer_attr.prebuf = (uint32_t)-1;
-  data.buffer_attr.tlength = pa_usec_to_bytes(latency, &data.sample_spec);
+  data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
 
   pa_stream_flags_t stream_flags;
   stream_flags = PA_STREAM_START_CORKED | PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_NOT_MONOTONIC |
@@ -330,6 +353,22 @@ static int play(void *buf, int samples) {
 
   while (data.requested_bytes < 0) {
     pa_threaded_mainloop_wait(data.mainloop);
+  }
+
+  if (data.latency_needs_update) {
+    debug(1, "pa: latency updated: %d", data.latency);
+    data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
+    data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+    data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
+    data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+
+    pa_operation* op = pa_stream_set_buffer_attr(data.stream, &data.buffer_attr, stream_success_cb, (void*)&data);
+    if (!op)
+      warn("pa: failed to set buffer attributes");
+    else
+      pa_operation_unref(op);
+
+    data.latency_needs_update = 0;
   }
 
   ret = pa_stream_write(data.stream, buf, bytes_to_transfer, NULL, 0, PA_SEEK_RELATIVE);
