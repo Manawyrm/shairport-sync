@@ -50,6 +50,8 @@ struct pa_struct {
   int locked;
   pa_usec_t latency;
   int latency_needs_update;
+  pa_cvolume volume;
+  int volume_needs_updating;
 } data;
 
 static void context_state_cb(__attribute__((unused)) pa_context *context, void *userdata) {
@@ -175,6 +177,8 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
       config.latency_threshold = 5000;
     }
   }
+
+  pa_cvolume_init(&data.volume);
 
   // Get a mainloop and its context
   data.mainloop = pa_threaded_mainloop_new();
@@ -355,6 +359,21 @@ static int play(void *buf, int samples) {
     pa_threaded_mainloop_wait(data.mainloop);
   }
 
+  if (data.volume_needs_updating == 1) {
+    char test[200];
+    pa_cvolume_snprint((char*)&test, 200, &data.volume);
+    debug(1, "volume: %s", test);
+
+    uint32_t index = pa_stream_get_index(data.stream);
+    pa_operation* op = pa_context_set_sink_input_volume(data.context, index, &data.volume, NULL, NULL);
+    if (op == NULL)
+      warn("pa: failed to set volume");
+    else
+      pa_operation_unref(op);
+
+    data.volume_needs_updating = 0;
+  }
+
   if (data.latency_needs_update) {
     debug(1, "pa: latency updated: %d", data.latency);
     data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
@@ -406,6 +425,26 @@ static void stop() {
   pa_try_unlock();
 }
 
+static void volume(double vol) {
+  pa_volume_t volume = pa_sw_volume_from_dB(vol);
+  pa_cvolume_set(&data.volume, data.sample_spec.channels, volume);
+  data.volume_needs_updating = 1;
+}
+
+static int mute(int mute) {
+  if (mute == 1) {
+    pa_cvolume_mute(&data.volume, data.sample_spec.channels);
+    data.volume_needs_updating = 1;
+  }
+
+  return !mute;
+}
+
+static void parameters(audio_parameters* info) {
+  info->maximum_volume_dB = pa_sw_volume_to_dB(PA_VOLUME_NORM);
+  info->minimum_volume_dB = PA_DECIBEL_MININFTY;
+}
+
 audio_output audio_pa = {
   .name = "pa",
   .help = NULL,
@@ -418,7 +457,7 @@ audio_output audio_pa = {
   .flush = &flush,
   .delay = NULL,
   .play = &play,
-  .volume = NULL,
-  .parameters = NULL,
-  .mute = NULL
+  .volume = &volume,
+  .parameters = &parameters,
+  .mute = &mute
 };
