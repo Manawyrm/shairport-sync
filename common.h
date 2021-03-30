@@ -123,6 +123,8 @@ typedef struct {
   // Defaults to "Shairport Sync". Shairport Sync must be playing to see it.
 
   char *pa_sink; // the name (or id) of the sink that Shairport Sync will play on.
+  int pa_min_latency;
+  int pa_max_latency;
 #endif
 #ifdef CONFIG_METADATA
   int metadata_enabled;

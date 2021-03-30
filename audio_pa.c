@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 struct pa_struct {
   pa_threaded_mainloop *mainloop;
@@ -47,6 +48,11 @@ struct pa_struct {
   pa_sample_spec sample_spec;
   pa_buffer_attr buffer_attr;
   int requested_bytes;
+  pa_usec_t latency;
+  int latency_needs_update;
+  uint8_t underflow;
+  uint8_t overflow;
+  int stopping;
 } data;
 
 static void context_state_cb(__attribute__((unused)) pa_context *context, void *userdata) {
@@ -63,6 +69,55 @@ static void stream_state_cb(__attribute__((unused)) pa_stream *s, void *userdata
 
 static void stream_latency_cb(__attribute__((unused)) pa_stream *s, void *userdata) {
   struct pa_struct* pulseaudio = (struct pa_struct*)userdata;
+  pa_usec_t latency;
+  int negative;
+  int ret;
+
+  if (pulseaudio->stopping == 1)
+    return;
+
+  ret = pa_stream_get_latency(pulseaudio->stream, &latency, &negative);
+  if (ret != 0)
+    return;
+
+  if (latency < (uint32_t)config.pa_min_latency)
+    return;
+
+  int64_t diff = (int64_t)(pulseaudio->latency - latency);
+  int64_t threshold = nearbyint((double)(pulseaudio->latency + latency) * 0.1);
+
+  if (labs(diff) < threshold)
+    return;
+
+  debug(1, "pa: latency adjustment");
+  debug(1, "pa: current:   %"PRIu64"", pulseaudio->latency);
+  debug(1, "pa: requested: %"PRIu64"", latency);
+  debug(1, "pa: diff: %"PRId64" > threshold: %"PRId64"", labs(diff), threshold);
+
+  pulseaudio->latency -= (diff / 2);
+
+  pulseaudio->latency = MAX(pulseaudio->latency, config.pa_min_latency);
+  pulseaudio->latency = MIN(pulseaudio->latency, config.pa_max_latency);
+
+  debug(1, "pa: latency: %"PRIu64"", pulseaudio->latency);
+
+  pulseaudio->latency_needs_update = 1;
+
+  pa_threaded_mainloop_signal(pulseaudio->mainloop, 0);
+}
+
+static void stream_underflow_cb(__attribute__((unused)) pa_stream *s, void *userdata) {
+  struct pa_struct* pulseaudio = (struct pa_struct*)userdata;
+
+  debug(1, "pa: underflow warning: %d", pulseaudio->underflow);
+
+  pa_threaded_mainloop_signal(pulseaudio->mainloop, 0);
+}
+
+static void stream_overflow_cb(__attribute__((unused)) pa_stream *s, void *userdata) {
+  struct pa_struct* pulseaudio = (struct pa_struct*)userdata;
+
+  debug(1, "pa: overflow warning: %d", pulseaudio->overflow);
 
   pa_threaded_mainloop_signal(pulseaudio->mainloop, 0);
 }
@@ -113,6 +168,9 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
 
   config.audio_backend_latency_offset = 0;
 
+  config.pa_min_latency = 100000;  // 100ms
+  config.pa_max_latency = 1000000; // 1000ms
+
   // get settings from settings file
 
   // do the "general" audio  options. Note, these options are in the "general" stanza!
@@ -121,6 +179,7 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
   // now the specific options
   if (config.cfg != NULL) {
     const char *str;
+    int value;
 
     /* Get the PulseAudio server name. */
     if (config_lookup_string(config.cfg, "pa.server", &str)) {
@@ -136,7 +195,24 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
     if (config_lookup_string(config.cfg, "pa.sink", &str)) {
       config.pa_sink = (char *)str;
     }
+
+    /* Get the PulseAudio min latency */
+    if (config_lookup_int(config.cfg, "pa.min_latency", &value) == CONFIG_TRUE) {
+      config.pa_min_latency = value;
+    }
+
+    /* Get the PulseAudio max latency */
+    if (config_lookup_int(config.cfg, "pa.max_latency", &value) == CONFIG_TRUE) {
+      config.pa_max_latency = value;
+    }
   }
+
+  debug(1, "pa: configuration");
+  debug(1, "pa: server: %s", config.pa_server);
+  debug(1, "pa: application_name: %s", config.pa_server);
+  debug(1, "pa: sink: %s", config.pa_server);
+  debug(1, "pa: min_latency: %d", config.pa_min_latency);
+  debug(1, "pa: max_latency: %d", config.pa_max_latency);
 
   // Get a mainloop and its context
   data.mainloop = pa_threaded_mainloop_new();
@@ -237,6 +313,8 @@ static int sps_format_to_pa_format(sps_format_t sps_format) {
 static void start(int sample_rate, int sample_format) {
   pa_threaded_mainloop_lock(data.mainloop);
 
+  data.stopping = 0;
+
   data.sample_spec.channels = 2;
   data.sample_spec.rate = sample_rate;
   data.sample_spec.format = sps_format_to_pa_format(sample_format);
@@ -259,14 +337,17 @@ static void start(int sample_rate, int sample_format) {
   pa_stream_set_state_callback(data.stream, stream_state_cb, (void*)&data);
   pa_stream_set_write_callback(data.stream, stream_write_cb, (void*)&data);
   pa_stream_set_latency_update_callback(data.stream, stream_latency_cb, (void*)&data);
+  pa_stream_set_underflow_callback(data.stream, stream_underflow_cb, (void*)&data);
+  pa_stream_set_overflow_callback(data.stream, stream_overflow_cb, (void*)&data);
 
-  pa_usec_t latency = 20000;
+  if (data.latency == 0)
+    data.latency = config.pa_min_latency;
 
-  data.buffer_attr.fragsize = pa_usec_to_bytes(latency, &data.sample_spec);
-  data.buffer_attr.maxlength = pa_usec_to_bytes(latency, &data.sample_spec);
+  data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
+  data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
   data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
   data.buffer_attr.prebuf = (uint32_t)-1;
-  data.buffer_attr.tlength = pa_usec_to_bytes(latency, &data.sample_spec);
+  data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
 
   pa_stream_flags_t stream_flags;
   stream_flags = PA_STREAM_START_CORKED | PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_NOT_MONOTONIC |
@@ -317,6 +398,22 @@ static int play(void *buf, int samples) {
     pa_threaded_mainloop_wait(data.mainloop);
   }
 
+  if (data.latency_needs_update) {
+    debug(1, "pa: latency updated: %d", data.latency);
+    data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
+    data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+    data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
+    data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+
+    pa_operation* op = pa_stream_set_buffer_attr(data.stream, &data.buffer_attr, stream_success_cb, (void*)&data);
+    if (!op)
+      warn("pa: failed to set buffer attributes");
+    else
+      pa_operation_unref(op);
+
+    data.latency_needs_update = 0;
+  }
+
   ret = pa_stream_write(data.stream, buf, bytes_to_transfer, NULL, 0, PA_SEEK_RELATIVE);
   data.requested_bytes -= bytes_to_transfer;
 
@@ -344,6 +441,8 @@ static void flush() {
 
 static void stop() {
   pa_threaded_mainloop_lock(data.mainloop);
+
+  data.stopping = 1;
 
   debug(1,"pa: drain and cork for stop");
   wait_for_operation(pa_stream_drain(data.stream, stream_success_cb, (void*)&data), data.mainloop, "drain");
