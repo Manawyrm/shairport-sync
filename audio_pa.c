@@ -47,7 +47,6 @@ struct pa_struct {
   pa_sample_spec sample_spec;
   pa_buffer_attr buffer_attr;
   int requested_bytes;
-  int locked;
 } data;
 
 static void context_state_cb(__attribute__((unused)) pa_context *context, void *userdata) {
@@ -104,20 +103,6 @@ static void wait_for_operation(pa_operation *op, pa_threaded_mainloop *mainloop,
   pa_operation_unref(op);
 }
 
-static void pa_try_lock() {
-  if (!data.locked) {
-    pa_threaded_mainloop_lock(data.mainloop);
-    data.locked = 1;
-  }
-}
-
-static void pa_try_unlock() {
-  if (data.locked) {
-    pa_threaded_mainloop_unlock(data.mainloop);
-    data.locked = 0;
-  }
-}
-
 static int init(__attribute__((unused)) int argc, __attribute__((unused)) char **argv) {
 
   // set up default values first
@@ -168,7 +153,7 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
   pa_context_set_state_callback(data.context, &context_state_cb, (void*)&data);
 
   // Lock the mainloop so that it does not run and crash before the context is ready
-  pa_try_lock();
+  pa_threaded_mainloop_lock(data.mainloop);
 
   // Start the mainloop
   if (pa_threaded_mainloop_start(data.mainloop) != 0)
@@ -189,7 +174,7 @@ static int init(__attribute__((unused)) int argc, __attribute__((unused)) char *
     pa_threaded_mainloop_wait(data.mainloop);
   }
 
-  pa_try_unlock();
+  pa_threaded_mainloop_unlock(data.mainloop);
 
   return 0;
 }
@@ -250,7 +235,7 @@ static int sps_format_to_pa_format(sps_format_t sps_format) {
 }
 
 static void start(int sample_rate, int sample_format) {
-  pa_try_lock();
+  pa_threaded_mainloop_lock(data.mainloop);
 
   data.sample_spec.channels = 2;
   data.sample_spec.rate = sample_rate;
@@ -315,14 +300,14 @@ static void start(int sample_rate, int sample_format) {
     pa_threaded_mainloop_wait(data.mainloop);
   }
 
-  pa_try_unlock();
+  pa_threaded_mainloop_unlock(data.mainloop);
 }
 
 static int play(void *buf, int samples) {
   size_t bytes_to_transfer = samples * data.sample_spec.channels * pa_sample_size_of_format(data.sample_spec.format);
   int ret;
 
-  pa_try_lock();
+  pa_threaded_mainloop_lock(data.mainloop);
 
   if (pa_stream_is_corked(data.stream) == 1) {
     wait_for_operation(pa_stream_cork(data.stream, 0, stream_success_cb, (void*)&data), data.mainloop, "uncork");
@@ -335,7 +320,7 @@ static int play(void *buf, int samples) {
   ret = pa_stream_write(data.stream, buf, bytes_to_transfer, NULL, 0, PA_SEEK_RELATIVE);
   data.requested_bytes -= bytes_to_transfer;
 
-  pa_try_unlock();
+  pa_threaded_mainloop_unlock(data.mainloop);
 
   if (ret) {
     warn("pa: pa_stream_write failed: %d", ret);
@@ -346,7 +331,7 @@ static int play(void *buf, int samples) {
 }
 
 static void flush() {
-  pa_try_lock();
+  pa_threaded_mainloop_lock(data.mainloop);
 
   if (pa_stream_is_corked(data.stream) == 0) {
     debug(1,"pa: flush and cork for flush");
@@ -354,17 +339,17 @@ static void flush() {
     wait_for_operation(pa_stream_cork(data.stream, 1, stream_success_cb, (void*)&data), data.mainloop, "cork");
   }
 
-  pa_try_unlock();
+  pa_threaded_mainloop_unlock(data.mainloop);
 }
 
 static void stop() {
-  pa_try_lock();
+  pa_threaded_mainloop_lock(data.mainloop);
 
   debug(1,"pa: drain and cork for stop");
   wait_for_operation(pa_stream_drain(data.stream, stream_success_cb, (void*)&data), data.mainloop, "drain");
   wait_for_operation(pa_stream_cork(data.stream, 1, stream_success_cb, (void*)&data), data.mainloop, "cork");
 
-  pa_try_unlock();
+  pa_threaded_mainloop_unlock(data.mainloop);
 }
 
 audio_output audio_pa = {
