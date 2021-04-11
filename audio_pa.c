@@ -76,8 +76,11 @@ static void stream_latency_cb(__attribute__((unused)) pa_stream *s, void *userda
   if (ret)
     return;
 
-  if (abs(pulseaudio->latency - latency) < config.latency_threshold)
+  if (abs((long)pulseaudio->latency - (long)latency) < config.latency_threshold)
     return;
+
+  if (latency > 2000000)
+    return; 
 
   pulseaudio->latency = latency;
   pulseaudio->latency_needs_update = 1;
@@ -88,7 +91,7 @@ static void stream_latency_cb(__attribute__((unused)) pa_stream *s, void *userda
 static void stream_write_cb(__attribute__((unused)) pa_stream *s, size_t requested_bytes, void *userdata) {
   struct pa_struct* pulseaudio = (struct pa_struct*)userdata;
 
-  pulseaudio->requested_bytes = requested_bytes;
+  pulseaudio->requested_bytes += requested_bytes;
   pa_threaded_mainloop_signal(pulseaudio->mainloop, 0);
 }
 
@@ -327,7 +330,8 @@ static void start(int sample_rate, int sample_format) {
 }
 
 static int play(void *buf, int samples) {
-  size_t bytes_to_transfer = samples * data.sample_spec.channels * pa_sample_size_of_format(data.sample_spec.format);
+  unsigned char *bufptr = buf;
+  ssize_t bytes_to_transfer = samples * data.sample_spec.channels * pa_sample_size_of_format(data.sample_spec.format);
   int ret;
 
   pa_threaded_mainloop_lock(data.mainloop);
@@ -336,35 +340,45 @@ static int play(void *buf, int samples) {
     wait_for_operation(pa_stream_cork(data.stream, 0, stream_success_cb, (void*)&data), data.mainloop, "uncork");
   }
 
-  while (data.requested_bytes < 0) {
-    pa_threaded_mainloop_wait(data.mainloop);
+  while (bytes_to_transfer) {
+    unsigned bytes_write;
+
+    while (data.requested_bytes <= 0) {
+      pa_threaded_mainloop_wait(data.mainloop);
+    }
+
+    if (data.latency_needs_update) {
+      debug(1, "pa: latency updated: %d", data.latency);
+      data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
+      data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+      data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
+      data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
+
+      pa_operation* op = pa_stream_set_buffer_attr(data.stream, &data.buffer_attr, stream_success_cb, (void*)&data);
+      if (!op)
+        warn("pa: failed to set buffer attributes");
+      else
+        pa_operation_unref(op);
+
+      data.latency_needs_update = 0;
+    }
+
+    bytes_write = data.requested_bytes < bytes_to_transfer ? data.requested_bytes : bytes_to_transfer;
+
+//    warn("Writing %u bytes of %d bytes\n", bytes_write, bytes_to_transfer);
+
+    ret = pa_stream_write(data.stream, bufptr, bytes_write, NULL, 0, PA_SEEK_RELATIVE);
+    data.requested_bytes -= bytes_write;
+    bufptr += bytes_write;
+    bytes_to_transfer -= bytes_write;
+
+    if (ret) {
+      warn("pa: pa_stream_write failed: %d", ret);
+      return ret;
+    }
   }
-
-  if (data.latency_needs_update) {
-    debug(1, "pa: latency updated: %d", data.latency);
-    data.buffer_attr.fragsize = pa_usec_to_bytes(data.latency, &data.sample_spec);
-    data.buffer_attr.maxlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
-    data.buffer_attr.minreq = pa_usec_to_bytes(0, &data.sample_spec);
-    data.buffer_attr.tlength = pa_usec_to_bytes(data.latency, &data.sample_spec);
-
-    pa_operation* op = pa_stream_set_buffer_attr(data.stream, &data.buffer_attr, stream_success_cb, (void*)&data);
-    if (!op)
-      warn("pa: failed to set buffer attributes");
-    else
-      pa_operation_unref(op);
-
-    data.latency_needs_update = 0;
-  }
-
-  ret = pa_stream_write(data.stream, buf, bytes_to_transfer, NULL, 0, PA_SEEK_RELATIVE);
-  data.requested_bytes -= bytes_to_transfer;
 
   pa_threaded_mainloop_unlock(data.mainloop);
-
-  if (ret) {
-    warn("pa: pa_stream_write failed: %d", ret);
-    return ret;
-  }
 
   return 0;
 }
@@ -391,6 +405,28 @@ static void stop() {
   pa_threaded_mainloop_unlock(data.mainloop);
 }
 
+static int delay(long *delay) {
+  pa_threaded_mainloop_lock(data.mainloop);
+  if (PA_STREAM_IS_GOOD(pa_stream_get_state(data.stream))) {
+    pa_usec_t latency_us;
+    int _, err;
+    uint32_t latency_samples;
+
+    err = pa_stream_get_latency(data.stream, &latency_us, &_);
+    if (err) {
+      latency_samples = 0;  
+    } else {
+      latency_samples = (uint64_t)latency_us * (uint64_t)data.sample_spec.rate / 1000000ULL;
+      debug(1, "latency: %lu samples\n", latency_samples);
+    }
+    *delay = latency_samples;
+  } else {
+    *delay = 0;
+  }
+  pa_threaded_mainloop_unlock(data.mainloop);
+  return 0;
+}
+
 audio_output audio_pa = {
   .name = "pa",
   .help = NULL,
@@ -401,6 +437,7 @@ audio_output audio_pa = {
   .stop = &stop,
   .is_running = NULL,
   .flush = &flush,
+//  .delay = &delay,
   .delay = NULL,
   .play = &play,
   .volume = NULL,
